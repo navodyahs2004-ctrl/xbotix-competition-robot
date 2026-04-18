@@ -1,0 +1,431 @@
+// Filename: task1_placement_logic.ino
+
+// --- PIN Definitions ---
+// Motor Pins (L298N)
+#define ENA 9    
+#define IN1 10   
+#define IN2 11   
+#define ENB 5    
+#define IN3 6    
+#define IN4 7    
+
+// 6 Line Sensor Pins (Analog)
+#define SENSOR_L3 A0 // Far Left
+#define SENSOR_L2 A1
+#define SENSOR_L1 A2
+#define SENSOR_R1 A3
+#define SENSOR_R2 A4
+#define SENSOR_R3 A5 // Far Right
+const int SENSOR_THRESHOLD = 500; // Adjust this value
+
+// --- System State Variables ---
+volatile bool isRunning = false; 
+volatile int task_state = 1;     // State Machine: 1 to 11
+volatile int turn_preference = 0; // -1 (Left first), 1 (Right first), 0 (Waiting for Pi)
+
+// --- Junction Management ---
+// J2 is the two-branch junction
+volatile bool right_visited = false;
+volatile bool left_visited = false;
+unsigned long deadEndStartTime = 0; // For 10-second wait
+
+// --- PID Constants (Tuning Required) ---
+float Kp = 1.0;
+float Ki = 0.001;
+float Kd = 0.5;
+
+// --- Motor Speed Constants ---
+const int BASE_SPEED = 100; 
+const int MAX_ADJUST = 100; 
+const int TURN_SPEED = 120; // Speed for 90/180 degree turns
+
+// --- PID Variables ---
+int error = 0;
+float P, I, D;
+float lastError = 0;
+unsigned long lastTime = 0;
+
+// --- Function Prototypes ---
+void read_sensors(int* sensor_values);
+void calculate_pid(int* sensor_values, int* leftSpeed, int* rightSpeed);
+void set_motor_speeds(int leftSpeed, int rightSpeed);
+void execute_turn(char direction, int* leftSpeed, int* rightSpeed, int sensors_on);
+void motor_stop();
+void serialEvent();
+void run_state_machine();
+bool is_cross_junction(int* s);
+bool is_t_junction(int* s);
+void rotate_until_line(bool clockwise);
+
+// =================================================================
+// SETUP
+// =================================================================
+void setup() {
+    // Motor Pins Setup
+    pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+    // Sensor Pins Setup
+    pinMode(SENSOR_L3, INPUT); pinMode(SENSOR_L2, INPUT); pinMode(SENSOR_L1, INPUT);
+    pinMode(SENSOR_R1, INPUT); pinMode(SENSOR_R2, INPUT); pinMode(SENSOR_R3, INPUT);
+
+    Serial.begin(9600);
+    motor_stop(); 
+}
+
+// =================================================================
+// MAIN LOOP
+// =================================================================
+void loop() {
+    serialEvent(); 
+
+    if (!isRunning) {
+        motor_stop();
+        return;
+    }
+
+    run_state_machine();
+}
+
+// =================================================================
+// STATE MACHINE CORE
+// =================================================================
+void run_state_machine() {
+    int s[6];
+    read_sensors(s);
+    int leftSpeed, rightSpeed;
+    
+    switch(task_state) {
+        
+        case 1: // PID Line Follow to J1 (First Cross Junction)
+            if (is_cross_junction(s)) {
+                // At J1 (Cross Junction): Must go straight
+                execute_turn('S', &leftSpeed, &rightSpeed, s[2] + s[3]);
+                Serial.println("State 1: Reached J1. Going Straight.");
+                task_state = 2; // Move to next state: Follow to J2
+            } else {
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+            
+        case 2: // PID Line Follow to J2 (T Junction)
+            if (is_t_junction(s)) {
+                motor_stop();
+                Serial.println("State 2: Reached J2. Waiting for Pi Turn preference...");
+                task_state = 3; // Wait for Pi command
+            } else {
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+            
+        case 3: // J2 Decision Point (Waiting for Pi Command)
+            if (turn_preference != 0) {
+                Serial.print("State 3: Preference received: "); Serial.println(turn_preference == 1 ? "Right" : "Left");
+                task_state = 4; // Move to first turn state
+            }
+            // Robot is stopped, waiting for serial command in serialEvent()
+            break;
+
+        case 4: // J2 Execute First Turn (Go to First Dead End)
+            if (turn_preference == 1 && !right_visited) { // Turn Right first
+                execute_turn('R', &leftSpeed, &rightSpeed, 0);
+                right_visited = true;
+                task_state = 5; // Follow line to Dead End
+            } else if (turn_preference == -1 && !left_visited) { // Turn Left first
+                execute_turn('L', &leftSpeed, &rightSpeed, 0);
+                left_visited = true;
+                task_state = 5; // Follow line to Dead End
+            } else {
+                // If the preference side was already visited, go to the other side
+                if (!right_visited) {
+                    execute_turn('R', &leftSpeed, &rightSpeed, 0);
+                    right_visited = true;
+                    task_state = 5;
+                } else if (!left_visited) {
+                    execute_turn('L', &leftSpeed, &rightSpeed, 0);
+                    left_visited = true;
+                    task_state = 5;
+                } else {
+                    // Both visited, error or skip (should be handled by state 7)
+                    task_state = 7;
+                }
+            }
+            break;
+            
+        case 5: // PID Line Follow to Dead End & Wait 10s
+            // Check for Dead End: No sensors on the line for a duration
+            if (s[0] == 0 && s[5] == 0 && s[2] == 0 && s[3] == 0) { 
+                motor_stop();
+                
+                // 10-Second Wait Logic
+                if (deadEndStartTime == 0) {
+                    deadEndStartTime = millis();
+                    Serial.println("State 5: Reached Dead End. Waiting 10s...");
+                    // Pi can send command '1' (stop) here, but the 10s delay is specified
+                }
+
+                if (millis() - deadEndStartTime >= 10000) {
+                    // 10 seconds elapsed. Place cube (implied) and turn back.
+                    Serial.println("10 seconds elapsed. Turning 180 and returning to J2.");
+                    rotate_until_line(false); // Spin left (or right, consistent rotation is key)
+                    deadEndStartTime = 0; // Reset timer
+                    task_state = 6; // Return to J2
+                }
+            } else {
+                // Line following
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+            
+        case 6: // Return to J2 (Wait for J2 detection)
+            if (is_t_junction(s)) { 
+                motor_stop();
+                if (left_visited && right_visited) {
+                    Serial.println("State 6: Reached J2 again. Both branches visited.");
+                    task_state = 7; // Both branches done, return to J1
+                } else {
+                    Serial.println("State 6: Reached J2. Visiting second branch.");
+                    task_state = 4; // Go to execute second turn
+                }
+            } else {
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+            
+        case 7: // J2 Final Return (Turn 180 towards J1)
+            Serial.println("State 7: J2 Final Return. Turning 180 degrees towards J1.");
+            rotate_until_line(true); // Spin right
+            task_state = 8; // Follow line back to J1
+            break;
+            
+        case 8: // PID Line Follow to J1 (Second time)
+            if (is_cross_junction(s)) {
+                // At J1 (Cross Junction): Must turn left
+                Serial.println("State 8: Reached J1 second time. Turning Left.");
+                execute_turn('L', &leftSpeed, &rightSpeed, 0);
+                task_state = 9; // Follow line to new Cross Junction
+            } else {
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+
+        case 9: // PID Line Follow to New Cross Junction
+            if (is_cross_junction(s)) {
+                // At New Cross Junction: Must turn right
+                Serial.println("State 9: Reached New Cross Jct. Turning Right.");
+                execute_turn('R', &leftSpeed, &rightSpeed, 0);
+                task_state = 10; // Follow line to Final Dead End
+            } else {
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+            
+        case 10: // PID Line Follow to Final Dead End and STOP
+            // Check for Dead End: No sensors on the line
+            if (s[0] == 0 && s[5] == 0 && s[2] == 0 && s[3] == 0) { 
+                motor_stop();
+                Serial.println("State 10: Reached Final Dead End. Mission Complete.");
+                task_state = 11; // Final Stop State
+            } else {
+                calculate_pid(s, &leftSpeed, &rightSpeed);
+                set_motor_speeds(leftSpeed, rightSpeed);
+            }
+            break;
+            
+        case 11: // FINAL STOP
+            motor_stop();
+            // Stays here until Pi sends another command (e.g., to start Task 2)
+            break;
+
+        default:
+            // Safety state
+            motor_stop();
+            break;
+    }
+}
+
+// =================================================================
+// LOW-LEVEL FUNCTIONS (PID, Motors, Sensors)
+// =================================================================
+
+void read_sensors(int* sensor_values) {
+    sensor_values[0] = analogRead(SENSOR_L3) > SENSOR_THRESHOLD ? 1 : 0;
+    sensor_values[1] = analogRead(SENSOR_L2) > SENSOR_THRESHOLD ? 1 : 0;
+    sensor_values[2] = analogRead(SENSOR_L1) > SENSOR_THRESHOLD ? 1 : 0;
+    sensor_values[3] = analogRead(SENSOR_R1) > SENSOR_THRESHOLD ? 1 : 0;
+    sensor_values[4] = analogRead(SENSOR_R2) > SENSOR_THRESHOLD ? 1 : 0;
+    sensor_values[5] = analogRead(SENSOR_R3) > SENSOR_THRESHOLD ? 1 : 0;
+}
+
+void calculate_pid(int* sensor_values, int* leftSpeed, int* rightSpeed) {
+    // Weighting: -30, -20, -10, 10, 20, 30
+    int position = (sensor_values[0] * -30) + (sensor_values[1] * -20) + 
+                   (sensor_values[2] * -10) + (sensor_values[3] * 10) + 
+                   (sensor_values[4] * 20) + (sensor_values[5] * 30);
+    
+    int sensorsOnLine = 0;
+    for(int i = 0; i < 6; i++) {
+        sensorsOnLine += sensor_values[i];
+    }
+    
+    if (sensorsOnLine > 0) {
+        error = position / sensorsOnLine;
+    } else {
+        error = lastError;
+    }
+    
+    unsigned long currentTime = millis();
+    float deltaTime = (currentTime - lastTime) / 1000.0; 
+    lastTime = currentTime;
+
+    P = error;
+    I += error * deltaTime;
+    D = (error - lastError) / deltaTime;
+    
+    float correction = Kp * P + Ki * I + Kd * D;
+    lastError = error;
+
+    int leftAdjustment = (int)correction;
+    int rightAdjustment = (int)correction;
+
+    *leftSpeed = constrain(BASE_SPEED + leftAdjustment, 0, 255);
+    *rightSpeed = constrain(BASE_SPEED - rightAdjustment, 0, 255);
+}
+
+void set_motor_speeds(int leftSpeed, int rightSpeed) {
+    // Forward movement (adjust IN1/IN2 and IN3/IN4 as per L298N wiring)
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, leftSpeed);
+
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, rightSpeed);
+}
+
+void execute_turn(char direction, int* leftSpeed, int* rightSpeed, int sensors_on) {
+    // Move forward slightly to clear the junction detection area first
+    *leftSpeed = BASE_SPEED;
+    *rightSpeed = BASE_SPEED;
+    set_motor_speeds(*leftSpeed, *rightSpeed);
+    delay(200); 
+    
+    // Execute turn
+    if (direction == 'L') {
+        // Spin Left: Left Reverse, Right Forward
+        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); 
+        digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+        analogWrite(ENA, TURN_SPEED);
+        analogWrite(ENB, TURN_SPEED);
+        delay(350); // Tune this duration
+    } else if (direction == 'R') {
+        // Spin Right: Left Forward, Right Reverse
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+        analogWrite(ENA, TURN_SPEED);
+        analogWrite(ENB, TURN_SPEED);
+        delay(350); // Tune this duration
+    } else if (direction == 'S') {
+        // Go Straight (already did a small move forward)
+        // Just continue for a bit longer to ensure clear of junction
+        *leftSpeed = BASE_SPEED;
+        *rightSpeed = BASE_SPEED;
+        set_motor_speeds(*leftSpeed, *rightSpeed);
+        delay(400); 
+    }
+    
+    motor_stop();
+    delay(100);
+}
+
+void rotate_until_line(bool clockwise) {
+    // Rotates the robot 180 degrees by spinning until the line is detected again
+    if (clockwise) { // Spin Right
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+    } else { // Spin Left
+        digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+        digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+    }
+    analogWrite(ENA, TURN_SPEED);
+    analogWrite(ENB, TURN_SPEED);
+
+    int s[6];
+    unsigned long startRotateTime = millis();
+    // Use a minimum time to ensure a proper turn past 90 degrees
+    while (millis() - startRotateTime < 800) { 
+        read_sensors(s);
+        // Look for the line under the central sensors
+        if (s[2] == 1 || s[3] == 1) { 
+            break; 
+        }
+    }
+    
+    motor_stop();
+    delay(100);
+}
+
+void motor_stop() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+}
+
+// =================================================================
+// JUNCTION DETECTION
+// =================================================================
+
+bool is_cross_junction(int* s) {
+    // All 6 sensors on the line is a definite cross junction
+    if (s[0] == 1 && s[1] == 1 && s[2] == 1 && s[3] == 1 && s[4] == 1 && s[5] == 1) {
+        return true;
+    }
+    return false;
+}
+
+bool is_t_junction(int* s) {
+    // If most sensors are on the line, but not the far sides, it's often a T-junction 
+    // when coming from the straight part, or simply a major intersection.
+    int sensors_on = s[0] + s[1] + s[2] + s[3] + s[4] + s[5];
+    // T-junction is typically 4, 5, or 6 sensors on, depending on track width. 
+    // We use a high threshold to differentiate it from simple curves.
+    if (sensors_on >= 4) {
+        return true;
+    }
+    return false;
+}
+
+// =================================================================
+// SERIAL EVENT HANDLER (Communication with Pi)
+// =================================================================
+void serialEvent() {
+    while (Serial.available()) {
+        char command = (char)Serial.read();
+
+        if (command == '0') {
+            isRunning = true;
+            Serial.println("START command received. Running.");
+        } else if (command == '1') {
+            isRunning = false;
+            motor_stop();
+            Serial.println("STOP command received. Stopping.");
+        } else if (command == '+') {
+            // Pi sends '+' for Turn = 1 (Right first)
+            turn_preference = 1;
+            Serial.println("Pi set Turn=1 (Right First)");
+        } else if (command == '-') {
+            // Pi sends '-' for Turn = -1 (Left first)
+            turn_preference = -1;
+            Serial.println("Pi set Turn=-1 (Left First)");
+        }
+    }
+}

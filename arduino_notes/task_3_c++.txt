@@ -1,0 +1,373 @@
+// Filename: task3_wall_following_logic.ino
+
+// --- PIN Definitions ---
+// Motor Pins (L298N)
+#define ENA 9    
+#define IN1 10   
+#define IN2 11   
+#define ENB 5    
+#define IN3 6    
+#define IN4 7    
+
+// Ultrasonic Sensor Pins (3 Sensors)
+// Sensor L: Left (tilted 45 degrees)
+#define TRIG_L 3   
+#define ECHO_L 2
+// Sensor F: Front 
+#define TRIG_F 8
+#define ECHO_F 7
+// Sensor R: Right (tilted 45 degrees)
+#define TRIG_R 13
+#define ECHO_R 12
+
+// --- Wall Following Constants ---
+const int TARGET_DISTANCE = 20;  // Target distance to keep from the right wall (in cm)
+const int WALL_FOLLOW_TOLERANCE = 5; // Acceptable deviation (cm)
+const int SIDE_PATH_THRESHOLD = 50; // Distance (cm) indicating a side path opening
+const int FRONT_OBSTACLE_DISTANCE = 15; // Slow down/stop if front wall is closer than this
+
+// --- Task 3 Mission Memory ---
+volatile bool isRunning = false; 
+volatile int task_state = 1;        // State Machine: 1 to 9
+const int NUM_SIDE_PATHS = 5;
+volatile int paths_visited_count = 0; // Tracks the progress
+volatile char last_side_path_direction = 'N'; // 'R' for Right, 'L' for Left
+unsigned long deadEndStartTime = 0; 
+int current_distances[3] = {0, 0, 0}; // L, F, R distances
+
+// --- Wall Following PID Constants (Tuning Required) ---
+// PID uses the difference between TARGET_DISTANCE and actual Right sensor reading
+float Kp = 3.0;
+float Ki = 0.01;
+float Kd = 1.0; 
+
+// --- Motor Speed Constants ---
+const int BASE_SPEED = 100; 
+const int TURN_SPEED = 120; 
+
+// --- PID Variables ---
+int error = 0;
+float P, I, D;
+float lastError = 0;
+unsigned long lastTime = 0;
+
+// --- Function Prototypes ---
+long read_ultrasonic_distance(int trigPin, int echoPin);
+void read_all_distances(int* d);
+void calculate_wall_following_pid(int right_distance, int front_distance, int* leftSpeed, int* rightSpeed);
+void set_motor_speeds(int leftSpeed, int rightSpeed);
+void execute_turn(char direction, int* leftSpeed, int* rightSpeed, int turn_duration);
+void motor_stop();
+void serialEvent();
+void run_state_machine();
+
+// =================================================================
+// SETUP
+// =================================================================
+void setup() {
+    // Motor Pins Setup
+    pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+    // Ultrasonic Pin Setup
+    pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+    pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
+    pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
+
+    Serial.begin(9600);
+    motor_stop(); 
+}
+
+// =================================================================
+// MAIN LOOP
+// =================================================================
+void loop() {
+    serialEvent(); 
+
+    if (!isRunning) {
+        motor_stop();
+        return;
+    }
+    
+    // Read distances once per loop cycle
+    read_all_distances(current_distances);
+    run_state_machine();
+}
+
+// =================================================================
+// STATE MACHINE CORE
+// =================================================================
+void run_state_machine() {
+    int L = current_distances[0]; // Left distance
+    int F = current_distances[1]; // Front distance
+    int R = current_distances[2]; // Right distance
+    
+    int leftSpeed, rightSpeed;
+    
+    switch(task_state) {
+        
+        case 1: // Find First 90-degree Right Turn
+            Serial.println("State 1: Finding first 90-degree Right Turn...");
+            
+            // Wall following towards corner
+            calculate_wall_following_pid(R, F, &leftSpeed, &rightSpeed);
+            set_motor_speeds(leftSpeed, rightSpeed);
+
+            // Turn Detection: Wall on the right disappears AND front distance is short (i.e., we are at the corner)
+            if (F < TARGET_DISTANCE + 5 && R > SIDE_PATH_THRESHOLD) {
+                // Execute the turn
+                Serial.println("State 1: First 90-degree Right Turn detected.");
+                execute_turn('R', &leftSpeed, &rightSpeed, 500); // 500ms duration for 90-degree turn
+                task_state = 2; 
+            }
+            break;
+
+        case 2: // Wall Follow & Check for Side Paths (Main Loop)
+            if (paths_visited_count >= NUM_SIDE_PATHS) {
+                Serial.println("State 2: All 5 paths visited. Looking for final exit turn.");
+                task_state = 7;
+                return;
+            }
+
+            // Check for side paths (Gaps in the wall)
+            if (L > SIDE_PATH_THRESHOLD) {
+                last_side_path_direction = 'L';
+                Serial.println("State 2: Left Side Path detected.");
+                task_state = 3; 
+            } else if (R > SIDE_PATH_THRESHOLD + 10 && R < 100) { 
+                // A gap on the right. Add a buffer (10cm) to differentiate from normal wall following variance.
+                last_side_path_direction = 'R';
+                Serial.println("State 2: Right Side Path detected.");
+                task_state = 3; 
+            }
+            
+            // Normal wall following
+            calculate_wall_following_pid(R, F, &leftSpeed, &rightSpeed);
+            set_motor_speeds(leftSpeed, rightSpeed);
+            break;
+            
+        case 3: // Enter Side Path
+            // Stop to decide, then turn and commit to the path
+            motor_stop();
+            delay(200);
+            
+            if (last_side_path_direction == 'R') {
+                execute_turn('R', &leftSpeed, &rightSpeed, 350); // Shorter turn into path
+            } else if (last_side_path_direction == 'L') {
+                execute_turn('L', &leftSpeed, &rightSpeed, 350); // Shorter turn into path
+            }
+            Serial.println("State 3: Entered side path. Following to dead end.");
+            task_state = 4; 
+            break;
+            
+        case 4: // Follow to Dead End & Wait 10s ⏳
+            // Wall following in the side path (assumes walls on both sides, or at least one)
+            calculate_wall_following_pid(R, F, &leftSpeed, &rightSpeed);
+            set_motor_speeds(leftSpeed, rightSpeed);
+
+            // Dead End Check: Front sensor detects a wall nearby
+            if (F < FRONT_OBSTACLE_DISTANCE) { 
+                motor_stop();
+                
+                // 10-Second Wait Logic
+                if (deadEndStartTime == 0) {
+                    deadEndStartTime = millis();
+                    Serial.println("State 4: Reached Dead End. Waiting 10s...");
+                }
+
+                if (millis() - deadEndStartTime >= 10000) {
+                    Serial.println("10 seconds elapsed. Turning 180 and returning.");
+                    deadEndStartTime = 0; 
+                    task_state = 5; // Move to 180 turn
+                }
+            }
+            break;
+            
+        case 5: // Execute 180-degree Turn
+            Serial.println("State 5: Executing 180-degree turn.");
+            execute_turn('R', &leftSpeed, &rightSpeed, 700); // Tune duration for 180
+            task_state = 6; // Follow back to main line
+            break;
+            
+        case 6: // Return to Main Path Junction
+            // Wall following out of the dead end
+            calculate_wall_following_pid(R, F, &leftSpeed, &rightSpeed);
+            set_motor_speeds(leftSpeed, rightSpeed);
+
+            // Rejoin Detection: When the sensor reading for the side path direction increases sharply
+            // This means we are leaving the side path and the main path gap is open.
+            bool path_open = (last_side_path_direction == 'R' && R > SIDE_PATH_THRESHOLD) ||
+                             (last_side_path_direction == 'L' && L > SIDE_PATH_THRESHOLD);
+
+            if (path_open) {
+                motor_stop(); // Stop before decisive turn
+                
+                // Rejoin Main Path Turn: Must turn the OPPOSITE direction of the side path
+                if (last_side_path_direction == 'R') {
+                    // Came from Right path, turn Left to rejoin main path
+                    execute_turn('L', &leftSpeed, &rightSpeed, 350); 
+                } else if (last_side_path_direction == 'L') {
+                    // Came from Left path, turn Right to rejoin main path
+                    execute_turn('R', &leftSpeed, &rightSpeed, 350); 
+                }
+                
+                paths_visited_count++;
+                last_side_path_direction = 'N'; // Reset direction memory
+                Serial.print("State 6: Path visited count: "); Serial.println(paths_visited_count);
+                task_state = 2; // Return to main wall following loop
+            }
+            break;
+            
+        case 7: // Final Wall Following Segment
+            Serial.println("State 7: Final segment. Wall following towards exit turn.");
+            // Normal wall following
+            calculate_wall_following_pid(R, F, &leftSpeed, &rightSpeed);
+            set_motor_speeds(leftSpeed, rightSpeed);
+
+            // Check for Final 90-degree Turn
+            // Detection: Wall on the right disappears AND front is clear (we are exiting the wall path)
+            if (R > SIDE_PATH_THRESHOLD && F > TARGET_DISTANCE) {
+                Serial.println("State 7: Transitioning to final turn detection.");
+                task_state = 8;
+            }
+            break;
+            
+        case 8: // Execute Final 90-degree Right Turn and Stop
+            // Stop and turn
+            motor_stop();
+            delay(200);
+
+            Serial.println("State 8: Executing Final 90-degree Right Turn.");
+            execute_turn('R', &leftSpeed, &rightSpeed, 500);
+            
+            Serial.println("State 8: Final Turn Complete. Mission Complete.");
+            task_state = 9;
+            break;
+            
+        case 9: // FINAL STOP
+            motor_stop();
+            break;
+
+        default:
+            motor_stop();
+            break;
+    }
+}
+
+// =================================================================
+// LOW-LEVEL FUNCTIONS (US, PID, Motors)
+// =================================================================
+
+long read_ultrasonic_distance(int trigPin, int echoPin) {
+    // Clears the trigPin condition
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    // Sets the trigPin HIGH for 10 microseconds
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    // Reads the echoPin, returns the sound wave travel time in microseconds
+    long duration = pulseIn(echoPin, HIGH);
+    // Calculating the distance (speed of sound is 340 m/s or 29 microseconds per cm)
+    return duration / 58; 
+}
+
+void read_all_distances(int* d) {
+    // Reading sequence: L, F, R
+    d[0] = read_ultrasonic_distance(TRIG_L, ECHO_L); 
+    delay(50); // Delay between sensor readings to avoid interference
+    d[1] = read_ultrasonic_distance(TRIG_F, ECHO_F);
+    delay(50);
+    d[2] = read_ultrasonic_distance(TRIG_R, ECHO_R);
+    delay(50);
+}
+
+void calculate_wall_following_pid(int right_distance, int front_distance, int* leftSpeed, int* rightSpeed) {
+    // 1. Calculate Error (Alignment) based on the Right sensor
+    error = right_distance - TARGET_DISTANCE;
+    
+    unsigned long currentTime = millis();
+    float deltaTime = (currentTime == lastTime) ? 0.001 : (currentTime - lastTime) / 1000.0; 
+    lastTime = currentTime;
+
+    P = error;
+    I = I + error * deltaTime;
+    I = constrain(I, -50, 50); 
+    D = (error - lastError) / deltaTime;
+    
+    float correction = Kp * P + Ki * I + Kd * D;
+    lastError = error;
+
+    int leftAdjustment = (int)correction;
+    int rightAdjustment = (int)correction;
+    
+    // 2. Adjust Speed based on the Front sensor (Obstacle Avoidance)
+    int speed_factor = BASE_SPEED;
+    if (front_distance < FRONT_OBSTACLE_DISTANCE) {
+        speed_factor = BASE_SPEED / 3; // Slow down significantly
+    } else if (front_distance < TARGET_DISTANCE) {
+        speed_factor = BASE_SPEED / 2; // Slow down moderately
+    }
+
+    // 3. Apply adjustments
+    *leftSpeed = constrain(speed_factor + leftAdjustment, 0, 255);
+    *rightSpeed = constrain(speed_factor - rightAdjustment, 0, 255);
+}
+
+void set_motor_speeds(int leftSpeed, int rightSpeed) {
+    // Forward movement 
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, leftSpeed);
+
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, rightSpeed);
+}
+
+void execute_turn(char direction, int* leftSpeed, int* rightSpeed, int turn_duration) {
+    // Execute spin turn for a fixed duration (requires physical tuning)
+    if (direction == 'L') {
+        // Spin Left: Left Reverse, Right Forward
+        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); 
+        digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+    } else if (direction == 'R') {
+        // Spin Right: Left Forward, Right Reverse
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    } 
+    
+    analogWrite(ENA, TURN_SPEED);
+    analogWrite(ENB, TURN_SPEED);
+    delay(turn_duration); 
+    
+    motor_stop();
+    delay(100);
+}
+
+void motor_stop() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+}
+
+// =================================================================
+// SERIAL EVENT HANDLER (Communication with Pi)
+// =================================================================
+void serialEvent() {
+    while (Serial.available()) {
+        char command = (char)Serial.read();
+
+        if (command == '0') {
+            isRunning = true;
+            Serial.println("START command received. Running Task 3.");
+        } else if (command == '1') {
+            isRunning = false;
+            motor_stop();
+            Serial.println("STOP command received. Stopping.");
+        } 
+    }
+}

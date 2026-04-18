@@ -1,0 +1,230 @@
+// Filename: task1_line_follower.ino (Fixed Version)
+
+// --- PIN Definitions ---
+#define ENA 9    // PWM for Left Motor
+#define IN1 10   // Left Motor Input 1
+#define IN2 11   // Left Motor Input 2
+#define ENB 5    // PWM for Right Motor
+#define IN3 6    // Right Motor Input 3
+#define IN4 7    // Right Motor Input 4
+
+// Sensor Pins: L3, L2, L1, R1, R2, R3 (Analog A0 to A5)
+#define SENSOR_L3 A0
+#define SENSOR_L2 A1
+#define SENSOR_L1 A2
+#define SENSOR_R1 A3
+#define SENSOR_R2 A4
+#define SENSOR_R3 A5
+
+// --- Serial State ---
+volatile bool isRunning = false;
+char upcomingTurn = 'N'; // Next junction command from Pi
+
+// --- PID Constants ---
+float Kp = 1.0;
+float Ki = 0.001;
+float Kd = 0.5;
+
+const int BASE_SPEED = 100;
+
+// --- PID Variables ---
+int error = 0;
+float P = 0, I = 0, D = 0;
+float lastError = 0;
+unsigned long lastTime = 0;
+
+// --- Junction Memory ---
+#define JUNCTION_MEMORY_SIZE 10
+char junctionMemory[JUNCTION_MEMORY_SIZE];
+int memoryIndex = 0;
+
+// --- Dead End ---
+unsigned long deadEndTime = 0;
+#define DEAD_END_THRESHOLD 800
+
+// --- Function Declarations ---
+void read_sensors(int* sensor_values);
+void calculate_pid(int* sensor_values, int* leftSpeed, int* rightSpeed);
+void set_motor_speeds(int leftSpeed, int rightSpeed);
+void motor_stop();
+void serialEvent();
+void handle_junction(int* sensor_values);
+void handle_dead_end();
+bool is_junction(int* s);
+
+// =================================================================
+void setup() {
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(SENSOR_L3, INPUT); pinMode(SENSOR_L2, INPUT); pinMode(SENSOR_L1, INPUT);
+  pinMode(SENSOR_R1, INPUT); pinMode(SENSOR_R2, INPUT); pinMode(SENSOR_R3, INPUT);
+
+  Serial.begin(9600);
+  motor_stop();
+  lastTime = millis();
+
+  for (int i = 0; i < JUNCTION_MEMORY_SIZE; i++) {
+    junctionMemory[i] = 'N';
+  }
+}
+
+// =================================================================
+void loop() {
+  serialEvent();
+  if (!isRunning) {
+    motor_stop();
+    return;
+  }
+
+  static int leftMotorSpeed = 0, rightMotorSpeed = 0;
+  int sensorValues[6];
+  read_sensors(sensorValues);
+
+  if (is_junction(sensorValues)) {
+    handle_junction(sensorValues);
+    return;
+  } 
+  else if (sensorValues[0]==0 && sensorValues[1]==0 && sensorValues[2]==0 &&
+           sensorValues[3]==0 && sensorValues[4]==0 && sensorValues[5]==0) {
+    if (deadEndTime == 0) {
+      deadEndTime = millis();
+    }
+    if (millis() - deadEndTime > DEAD_END_THRESHOLD) {
+      handle_dead_end();
+      return;
+    }
+    // Continue with previous speeds while searching
+  } else {
+    deadEndTime = 0;
+    calculate_pid(sensorValues, &leftMotorSpeed, &rightMotorSpeed);
+  }
+
+  set_motor_speeds(leftMotorSpeed, rightMotorSpeed);
+}
+
+// =================================================================
+void read_sensors(int* s) {
+  const int THRESHOLD = 500;
+  s[0] = analogRead(SENSOR_L3) > THRESHOLD ? 1 : 0;
+  s[1] = analogRead(SENSOR_L2) > THRESHOLD ? 1 : 0;
+  s[2] = analogRead(SENSOR_L1) > THRESHOLD ? 1 : 0;
+  s[3] = analogRead(SENSOR_R1) > THRESHOLD ? 1 : 0;
+  s[4] = analogRead(SENSOR_R2) > THRESHOLD ? 1 : 0;
+  s[5] = analogRead(SENSOR_R3) > THRESHOLD ? 1 : 0;
+}
+
+void calculate_pid(int* s, int* leftSpeed, int* rightSpeed) {
+  int pos = s[0]*-30 + s[1]*-20 + s[2]*-10 + s[3]*10 + s[4]*20 + s[5]*30;
+  int count = 0;
+  for (int i = 0; i < 6; i++) count += s[i];
+  error = (count > 0) ? pos / count : lastError;
+
+  unsigned long now = millis();
+  float deltaTime = (now - lastTime) / 1000.0;
+  if (deltaTime == 0) deltaTime = 0.01;
+  lastTime = now;
+
+  P = error;
+  I += error * deltaTime;
+  D = (error - lastError) / deltaTime;
+  float correction = Kp * P + Ki * I + Kd * D;
+  lastError = error;
+
+  *leftSpeed = constrain(BASE_SPEED + correction, 0, 255);
+  *rightSpeed = constrain(BASE_SPEED - correction, 0, 255);
+}
+
+// =================================================================
+void set_motor_speeds(int leftSpeed, int rightSpeed) {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  analogWrite(ENA, leftSpeed);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENB, rightSpeed);
+}
+
+void motor_stop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+}
+
+// =================================================================
+bool is_junction(int* s) {
+  int count = 0;
+  for (int i = 0; i < 6; i++) count += s[i];
+  return count >= 4;
+}
+
+void handle_junction(int* s) {
+  motor_stop();
+  delay(100);
+
+  char turn = 'N';
+  if (memoryIndex < JUNCTION_MEMORY_SIZE && junctionMemory[memoryIndex] != 'N') {
+    turn = junctionMemory[memoryIndex];
+  } else if (upcomingTurn != 'N') {
+    turn = upcomingTurn;
+    junctionMemory[memoryIndex] = upcomingTurn;
+    upcomingTurn = 'N';
+  } else {
+    turn = 'R'; // default if no Pi command received
+    junctionMemory[memoryIndex] = 'R';
+  }
+
+  if (turn == 'L') {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); // Left Reverse
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); // Right Forward
+  } else if (turn == 'R') {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  } else if (turn == 'S') {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  }
+  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENB, BASE_SPEED);
+  delay(400);
+
+  motor_stop();
+  delay(100);
+
+  memoryIndex++;
+  if (memoryIndex >= JUNCTION_MEMORY_SIZE) memoryIndex = JUNCTION_MEMORY_SIZE - 1;
+}
+
+void handle_dead_end() {
+  Serial.println("Dead end. Rotating 180...");
+  motor_stop(); delay(200);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 150); analogWrite(ENB, 150);
+
+  int s[6];
+  unsigned long start = millis();
+  while (millis() - start < 2000) {
+    read_sensors(s);
+    if (s[2] == 1 || s[3] == 1) break;
+  }
+  motor_stop();
+  deadEndTime = 0;
+  delay(500);
+}
+
+// =================================================================
+void serialEvent() {
+  while (Serial.available()) {
+    char cmd = (char)Serial.read();
+    if (cmd == '0') {
+      isRunning = true;
+      Serial.println("START command received.");
+    } else if (cmd == '1') {
+      isRunning = false;
+      motor_stop();
+      Serial.println("STOP command received.");
+    } else if (cmd == 'L' || cmd == 'R' || cmd == 'S') {
+      upcomingTurn = cmd;
+      Serial.print("Upcoming junction turn set to: "); Serial.println(cmd);
+    }
+  }
+}
